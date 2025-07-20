@@ -1,19 +1,43 @@
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord import app_commands, Interaction
 import asyncio
 import random
+import json
+import os
+
 from ballsdex.core.models import BallInstance
 from ballsdex.core.utils.transformers import BallInstanceTransform
 
 MAX_HORSES_PER_PLAYER = 10
 TURN_DELAY = 7  # seconds between turns
+WIN_FILE = "race_wins.json"
+
 
 class Race(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.active_races = {}  # user_id -> race data
-        self.pending_challenges = {}  # challenger_id -> opponent_id
+        self.active_races = {}
+        self.pending_challenges = {}
+        self.win_counts = self.load_win_counts()
+
+    def load_win_counts(self):
+        if os.path.exists(WIN_FILE):
+            try:
+                with open(WIN_FILE, "r") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+    def save_win_counts(self):
+        with open(WIN_FILE, "w") as f:
+            json.dump(self.win_counts, f)
+
+    def increment_win(self, user_id: int):
+        str_id = str(user_id)
+        self.win_counts[str_id] = self.win_counts.get(str_id, 0) + 1
+        self.save_win_counts()
 
     @app_commands.command(name="challenge", description="Challenge another player to a race")
     @app_commands.describe(
@@ -33,7 +57,6 @@ class Race(commands.Cog):
             await interaction.response.send_message("Either you or your opponent is already in a race.", ephemeral=True)
             return
 
-        # Store the challenge including track_length
         self.pending_challenges[interaction.user.id] = {
             "opponent": opponent.id,
             "track_length": track_length
@@ -90,10 +113,10 @@ class Race(commands.Cog):
     @app_commands.command(name="cancel", description="Cancel a pending race challenge")
     async def race_cancel(self, interaction: Interaction):
         user_id = interaction.user.id
-
         if user_id in self.pending_challenges:
-            opponent = self.pending_challenges.pop(user_id)
-            await interaction.response.send_message(f"Cancelled your challenge to <@{opponent}>.")
+            challenge = self.pending_challenges.pop(user_id)
+            opponent_id = challenge['opponent']
+            await interaction.response.send_message(f"Cancelled your challenge to <@{opponent_id}>.")
             return
 
         for challenger, opponent in list(self.pending_challenges.items()):
@@ -192,7 +215,8 @@ class Race(commands.Cog):
             f"{interaction.user.mention} has forfeited the race. {opponent_mention} wins!"
         )
 
-        # Remove both players from active races to stop the race loop
+        self.increment_win(opponent_id)
+
         self.active_races.pop(user_id, None)
         self.active_races.pop(opponent_id, None)
 
@@ -201,7 +225,6 @@ class Race(commands.Cog):
         race2 = self.active_races.get(user2_id)
 
         if not race1 or not race2:
-            # One or both players not in race anymore (possibly forfeited)
             return
 
         user1 = self.bot.get_user(user1_id) or await self.bot.fetch_user(user1_id)
@@ -215,7 +238,6 @@ class Race(commands.Cog):
                 (user2_id, race2, race1, user2),
             ]:
                 if race["current_index"] >= len(race["picked_horses"]):
-                    # No more horses for this player
                     continue
 
                 horse = race["picked_horses"][race["current_index"]]
@@ -239,15 +261,15 @@ class Race(commands.Cog):
                     else:
                         await channel.send(f"{user.mention} has no horses left!")
 
-            # Check if any player reached finish line
             if race1["distance"] >= race1["track_length"]:
                 await channel.send(f"{user1.mention} reached the finish line and wins the race! 🏆")
+                self.increment_win(user1_id)
                 break
             if race2["distance"] >= race2["track_length"]:
                 await channel.send(f"{user2.mention} reached the finish line and wins the race! 🏆")
+                self.increment_win(user2_id)
                 break
 
-            # Check if both players exhausted their horses
             both_exhausted = (
                 race1["current_index"] >= len(race1["picked_horses"]) and
                 race2["current_index"] >= len(race2["picked_horses"])
@@ -255,8 +277,10 @@ class Race(commands.Cog):
             if both_exhausted:
                 if race1["distance"] > race2["distance"]:
                     winner = user1
+                    self.increment_win(user1_id)
                 elif race2["distance"] > race1["distance"]:
                     winner = user2
+                    self.increment_win(user2_id)
                 else:
                     winner = None
 
@@ -266,17 +290,35 @@ class Race(commands.Cog):
                     await channel.send("🏁 It's a tie! Both players traveled the same distance.")
                 break
 
-            # Update race references in case someone forfeited mid-race
             race1 = self.active_races.get(user1_id)
             race2 = self.active_races.get(user2_id)
             if not race1 or not race2:
-                # Someone forfeited mid-race
                 break
 
-        # Safely remove players from active_races
         self.active_races.pop(user1_id, None)
         self.active_races.pop(user2_id, None)
 
+    @app_commands.command(name="leaderboard", description="View the race leaderboard")
+    async def leaderboard(self, interaction: Interaction):
+        if not self.win_counts:
+            await interaction.response.send_message("🏁 No races have been won yet.", ephemeral=True)
+            return
+
+        sorted_leaderboard = sorted(self.win_counts.items(), key=lambda x: x[1], reverse=True)
+        lines = []
+        for i, (user_id, wins) in enumerate(sorted_leaderboard[:10], start=1):
+            user = self.bot.get_user(int(user_id)) or await self.bot.fetch_user(int(user_id))
+            username = user.name if user else f"User {user_id}"
+            lines.append(f"**{i}. {username}** — {wins} win{'s' if wins != 1 else ''}")
+
+        leaderboard_text = "\n".join(lines)
+        await interaction.response.send_message(f"🏆 **Top Racers** 🏆\n{leaderboard_text}")
+
+    @app_commands.command(name="mywins", description="See how many races you've won")
+    async def mywins(self, interaction: Interaction):
+        user_id = str(interaction.user.id)
+        count = self.win_counts.get(user_id, 0)
+        await interaction.response.send_message(f"🏁 You have won **{count}** race{'s' if count != 1 else ''}.")
 
 async def setup(bot):
     await bot.add_cog(Race(bot))
